@@ -1,0 +1,331 @@
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+import numpy as np
+from datetime import datetime
+from io import BytesIO
+import base64
+
+from pdfgen import generate_certificate
+
+app = Flask(__name__)
+CORS(app)
+
+# =======================
+# CONSTANTS - FIXED
+# =======================
+RADIAL_RPM = [500, 700, 900, 1100, 1300, 1500]
+AXIAL_RPM = [2000, 2200, 2400, 2600, 2800, 3000]
+
+# Physics constants
+ROTOR_DIAMETER = 0.042
+ROTOR_LENGTH = 0.760
+SHAFT_DIAMETER = 0.042
+SHAFT_LENGTH = 0.125
+DENSITY_STEEL = 7850
+ROTOR_MASS = np.pi * (ROTOR_DIAMETER / 2) ** 2 * ROTOR_LENGTH * DENSITY_STEEL
+
+K_SHAFT = (3 * 2.1e11 * (np.pi * (SHAFT_DIAMETER ** 4) / 64)) / (SHAFT_LENGTH ** 3)
+C_SHAFT = 0.02 * K_SHAFT
+ECC = 0.0005
+dt = 0.1
+
+# Test state
+test_state = {
+    'status': 'STOPPED',
+    'timer': 0,
+    'load_live': 0,
+    'disp_radial': [0, 0, 0, 0],
+    'disp_axial': [0, 0, 0, 0],
+    'orbit_buffer': {'x': [], 'y': []},
+    'axial_wave': {'t': [], 'z': []},
+    'p2p_radial': 0,
+    'p2p_axial': 0,
+    'cert_ready': False,
+    'failure_reason': '',
+    'serial': ''
+}
+
+
+def rotor_2dof(rpm, disp, misalign, drag, noise=0):
+    """Simulate 2-DOF rotor dynamics with optional noise - FIXED VERSION"""
+    omega = rpm * 2 * np.pi / 60
+    
+    # Unpack displacement and velocity
+    x, vx, y, vy = disp
+    
+    # Prevent numerical overflow
+    x = np.clip(x, -1e-3, 1e-3)
+    y = np.clip(y, -1e-3, 1e-3)
+    vx = np.clip(vx, -1.0, 1.0)
+    vy = np.clip(vy, -1.0, 1.0)
+    
+    # Forces - REDUCED base magnitude for stability
+    F_centrifugal = ROTOR_MASS * ECC * omega ** 2 * 0.3  # REDUCED by 70%
+    F_x = F_centrifugal * np.cos(omega * dt) - K_SHAFT * x - C_SHAFT * vx
+    F_y = F_centrifugal * np.sin(omega * dt) - K_SHAFT * y - C_SHAFT * vy
+    
+    # Add misalignment effect - REDUCED sensitivity
+    F_x += misalign * 1e-8 * np.sin(omega * dt * 2)  # REDUCED from 2e-8
+    F_y += misalign * 1e-8 * np.cos(omega * dt * 2)  # REDUCED from 2e-8
+    
+    # Add drag - REDUCED sensitivity
+    F_x -= drag * vx * 5  # REDUCED from 10
+    F_y -= drag * vy * 5  # REDUCED from 10
+    
+    # Add noise if specified
+    if noise > 0:
+        F_x += np.random.randn() * noise * 5e-10  # REDUCED from 1e-9
+        F_y += np.random.randn() * noise * 5e-10  # REDUCED from 1e-9
+    
+    # Acceleration
+    ax = F_x / ROTOR_MASS
+    ay = F_y / ROTOR_MASS
+    
+    # Clip acceleration to prevent instability
+    ax = np.clip(ax, -100, 100)
+    ay = np.clip(ay, -100, 100)
+    
+    # Update velocity and position with smaller time step
+    dt_safe = 0.001  # Smaller time step for stability
+    vx_new = vx + ax * dt_safe
+    vy_new = vy + ay * dt_safe
+    x_new = x + vx_new * dt_safe
+    y_new = y + vy_new * dt_safe
+    
+    # Clip outputs
+    vx_new = np.clip(vx_new, -1.0, 1.0)
+    vy_new = np.clip(vy_new, -1.0, 1.0)
+    x_new = np.clip(x_new, -1e-3, 1e-3)
+    y_new = np.clip(y_new, -1e-3, 1e-3)
+    
+    return [x_new, vx_new, y_new, vy_new]
+
+
+@app.route('/api/start', methods=['POST'])
+def start_test():
+    """Start the test"""
+    global test_state
+    data = request.json
+    
+    test_state['status'] = 'RAMPING'
+    test_state['timer'] = 0
+    test_state['load_live'] = 0
+    test_state['disp_radial'] = [0, 0, 0, 0]
+    test_state['disp_axial'] = [0, 0, 0, 0]
+    test_state['orbit_buffer'] = {'x': [], 'y': []}
+    test_state['axial_wave'] = {'t': [], 'z': []}
+    test_state['p2p_radial'] = 0
+    test_state['p2p_axial'] = 0
+    test_state['cert_ready'] = False
+    test_state['failure_reason'] = ''
+    test_state['serial'] = data.get('serial', 'GBX-000000')
+    
+    return jsonify({'status': 'started', 'state': test_state})
+
+
+@app.route('/api/stop', methods=['POST'])
+def stop_test():
+    """Stop the test"""
+    global test_state
+    test_state['status'] = 'STOPPED'
+    test_state['timer'] = 0
+    test_state['load_live'] = 0
+    
+    return jsonify({'status': 'stopped', 'state': test_state})
+
+
+@app.route('/api/update', methods=['POST'])
+def update_simulation():
+    """Update simulation state - FIXED VERSION"""
+    global test_state
+    data = request.json
+    
+    target_load = data.get('load', 60)
+    drag = data.get('drag', 0.2)
+    misalign = data.get('misalignment', 2.5)
+    noise = data.get('noise', 0)  # Default to 0 for stability
+    mode = data.get('mode', 'RADIAL')
+    
+    if test_state['status'] == 'STOPPED':
+        return jsonify({'state': test_state})
+    
+    # RAMPING phase
+    if test_state['status'] == 'RAMPING':
+        test_state['load_live'] = min(target_load, test_state['load_live'] + 2.5)
+        
+        # Generate initial data during ramping - REDUCED base values
+        radial_forces = [test_state['load_live'] * 0.5] * len(RADIAL_RPM)  # Start lower
+        axial_forces = [test_state['load_live'] * 0.4] * len(AXIAL_RPM)    # Start lower
+        
+        test_state['radial_data'] = {
+            'rpm': RADIAL_RPM,
+            'force': radial_forces
+        }
+        test_state['axial_data'] = {
+            'rpm': AXIAL_RPM,
+            'force': axial_forces
+        }
+        
+        if test_state['load_live'] >= target_load:
+            test_state['status'] = 'MONITORING'
+    
+    # MONITORING phase
+    elif test_state['status'] == 'MONITORING':
+        test_state['timer'] += dt
+        
+        radial_forces = []
+        axial_forces = []
+        
+        # Simulate radial forces - FIXED FORMULA
+        for i, rpm in enumerate(RADIAL_RPM):
+            test_state['disp_radial'] = rotor_2dof(
+                rpm, test_state['disp_radial'], misalign, drag, noise
+            )
+            
+            # AGGRESSIVE force calculation for proper failure detection
+            base_force = 8 + (target_load / 100) * 12
+            
+            # Add RPM-dependent variation
+            rpm_normalized = rpm / 1500
+            rpm_factor = rpm_normalized * 6 + np.sin(rpm_normalized * 10) * 4
+            
+            # Force variation from displacement
+            force_variation = np.hypot(test_state['disp_radial'][0], test_state['disp_radial'][2]) * 30000
+            
+            # AGGRESSIVE parameter effects - MUST cause failures at high values
+            misalign_effect = misalign * 2.5 * (1 + rpm_normalized)  # VERY HIGH
+            drag_effect = drag * 10 * (1 + rpm_normalized)  # VERY HIGH
+            noise_effect = noise * 0.4 * np.random.randn()
+            
+            force = base_force + rpm_factor + force_variation + misalign_effect + drag_effect + noise_effect
+            force = np.clip(force, 5, 100)  # Increased max to 100
+            
+            radial_forces.append(force)
+            
+            # Debug: Print force breakdown for first RPM
+            if i == 0 and test_state['timer'] % 10 < 0.2:  # Every 10 seconds
+                print(f"RADIAL DEBUG @ {test_state['timer']:.1f}s:")
+                print(f"  Base: {base_force:.2f}N, RPM factor: {rpm_factor:.2f}N")
+                print(f"  Variation: {force_variation:.2f}N")
+                print(f"  Misalign effect: {misalign_effect:.2f}N (param={misalign})")
+                print(f"  Drag effect: {drag_effect:.2f}N (param={drag})")
+                print(f"  Total force: {force:.2f}N")
+            
+            # Update orbit buffer
+            test_state['orbit_buffer']['x'].append(test_state['disp_radial'][0] * 1000)
+            test_state['orbit_buffer']['y'].append(test_state['disp_radial'][2] * 1000)
+            if len(test_state['orbit_buffer']['x']) > 100:
+                test_state['orbit_buffer']['x'].pop(0)
+                test_state['orbit_buffer']['y'].pop(0)
+        
+        # Simulate axial forces - FIXED FORMULA
+        for i, rpm in enumerate(AXIAL_RPM):
+            test_state['disp_axial'] = rotor_2dof(
+                rpm, test_state['disp_axial'], misalign, drag, noise
+            )
+            
+            # AGGRESSIVE force calculation for proper failure detection
+            base_force = 7 + (target_load / 100) * 11
+            
+            # Add RPM-dependent variation
+            rpm_normalized = rpm / 3000
+            rpm_factor = rpm_normalized * 5 + np.cos(rpm_normalized * 10) * 4
+            
+            # Force variation from displacement
+            force_variation = np.hypot(test_state['disp_axial'][0], test_state['disp_axial'][2]) * 30000
+            
+            # AGGRESSIVE parameter effects - MUST cause failures at high values
+            misalign_effect = misalign * 2.2 * (1 + rpm_normalized)  # VERY HIGH
+            drag_effect = drag * 9 * (1 + rpm_normalized)  # VERY HIGH
+            noise_effect = noise * 0.35 * np.random.randn()
+            
+            force = base_force + rpm_factor + force_variation + misalign_effect + drag_effect + noise_effect
+            force = np.clip(force, 5, 100)  # Increased max to 100
+            
+            axial_forces.append(force)
+            
+            # Debug: Print force breakdown for first RPM
+            if i == 0 and test_state['timer'] % 10 < 0.2:  # Every 10 seconds
+                print(f"AXIAL DEBUG @ {test_state['timer']:.1f}s:")
+                print(f"  Base: {base_force:.2f}N, RPM factor: {rpm_factor:.2f}N")
+                print(f"  Variation: {force_variation:.2f}N")
+                print(f"  Misalign effect: {misalign_effect:.2f}N (param={misalign})")
+                print(f"  Drag effect: {drag_effect:.2f}N (param={drag})")
+                print(f"  Total force: {force:.2f}N")
+            
+            # Update axial waveform
+            test_state['axial_wave']['t'].append(test_state['timer'] + len(test_state['axial_wave']['t']) * dt * 0.1)
+            test_state['axial_wave']['z'].append(test_state['disp_axial'][0] * 1000)
+            if len(test_state['axial_wave']['t']) > 100:
+                test_state['axial_wave']['t'].pop(0)
+                test_state['axial_wave']['z'].pop(0)
+        
+        # Calculate peak-to-peak with safety checks
+        if len(radial_forces) > 0:
+            max_radial = max(radial_forces)
+            min_radial = min(radial_forces)
+            test_state['p2p_radial'] = max_radial - min_radial
+        else:
+            test_state['p2p_radial'] = 0
+            
+        if len(axial_forces) > 0:
+            max_axial = max(axial_forces)
+            min_axial = min(axial_forces)
+            test_state['p2p_axial'] = max_axial - min_axial
+        else:
+            test_state['p2p_axial'] = 0
+        
+        # Ensure values are finite
+        test_state['p2p_radial'] = float(np.clip(test_state['p2p_radial'], 0, 100))
+        test_state['p2p_axial'] = float(np.clip(test_state['p2p_axial'], 0, 100))
+        
+        # REALISTIC P2P limits - ADJUSTED for better failure detection
+        RADIAL_P2P_LIMIT = 22.0  # LOWERED from 25.0
+        AXIAL_P2P_LIMIT = 20.0   # LOWERED from 22.0
+        MIN_TEST_TIME = 120.0
+        
+        # Debug logging
+        print(f"DEBUG: Radial P2P = {test_state['p2p_radial']:.2f}N, Limit = {RADIAL_P2P_LIMIT}N")
+        print(f"DEBUG: Axial P2P = {test_state['p2p_axial']:.2f}N, Limit = {AXIAL_P2P_LIMIT}N")
+        print(f"DEBUG: Timer = {test_state['timer']:.1f}s, Min = {MIN_TEST_TIME}s")
+        
+        if test_state['p2p_radial'] > RADIAL_P2P_LIMIT:
+            test_state['status'] = 'FAIL'
+            test_state['cert_ready'] = True
+            test_state['failure_reason'] = f"Radial P2P ({test_state['p2p_radial']:.2f}N) exceeded limit ({RADIAL_P2P_LIMIT}N)"
+        elif test_state['p2p_axial'] > AXIAL_P2P_LIMIT:
+            test_state['status'] = 'FAIL'
+            test_state['cert_ready'] = True
+            test_state['failure_reason'] = f"Axial P2P ({test_state['p2p_axial']:.2f}N) exceeded limit ({AXIAL_P2P_LIMIT}N)"
+        elif test_state['timer'] >= MIN_TEST_TIME:
+            test_state['status'] = 'PASS'
+            test_state['cert_ready'] = True
+            test_state['failure_reason'] = ''
+        
+        # Prepare response data
+        test_state['radial_data'] = {
+            'rpm': RADIAL_RPM,
+            'force': radial_forces
+        }
+        test_state['axial_data'] = {
+            'rpm': AXIAL_RPM,
+            'force': axial_forces
+        }
+    
+    return jsonify({'state': test_state})
+
+
+@app.route('/api/certificate', methods=['POST'])
+def certificate_route():
+    """Generate and return certificate PDF"""
+    return generate_certificate(test_state)  # Pass test_state as parameter
+
+
+@app.route('/api/status', methods=['GET'])
+def get_status():
+    """Get current test status"""
+    return jsonify({'state': test_state})
+
+
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)
